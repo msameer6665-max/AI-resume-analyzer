@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -17,7 +18,8 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = "gemini-3.8-flash"  # change in the sidebar if Google releases a newer Flash
+DEFAULT_MODEL = "gemini-2.5-flash"  # change in the sidebar if Google releases a newer Flash
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]  # tried if the chosen model is busy
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 30_000
 MAX_JD_CHARS = 10_000
@@ -212,17 +214,36 @@ def normalize_result(data: dict) -> dict:
     }
 
 
+def _is_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(t in msg for t in ("503", "unavailable", "429", "resource_exhausted",
+                                  "500", "internal", "504", "deadline", "overloaded", "high demand"))
+
+
 def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str = "") -> dict:
-    """Run the analysis, retrying once if the model returns malformed JSON."""
+    """Run the analysis. Retries busy/overloaded errors and falls back to other Flash models."""
     prompt = build_prompt(resume_text, job_description)
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_error = None
-    for _ in range(2):
-        raw = call_gemini(api_key, model, prompt)
-        try:
-            return normalize_result(parse_json(raw))
-        except ValueError as exc:
-            last_error = exc
-    raise ValueError(f"Could not read the AI response after 2 attempts: {last_error}")
+    for m in models:
+        for attempt in range(3):
+            try:
+                raw = call_gemini(api_key, m, prompt)
+                return normalize_result(parse_json(raw))
+            except ValueError as exc:  # malformed JSON from the model -> retry
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+                msg = str(exc)
+                if any(k in msg for k in ("API key", "API_KEY_INVALID", "PERMISSION_DENIED")):
+                    raise
+                if "NOT_FOUND" in msg or "404" in msg:
+                    break  # model name doesn't exist -> try the next model
+                if not _is_transient(exc):
+                    raise
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"Gemini is very busy right now. Please try again in a minute. (Last error: {last_error})")
 
 
 # --------------------------------------------------------------------------- #
